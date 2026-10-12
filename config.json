@@ -1,0 +1,10 @@
+{
+  "pairs": {
+    "BTC-USDCX": true,
+    "ETH-USDCX": true,
+    "SOL-USDCX": false,
+    "CC-USDCX": false
+  },
+  "min_profit_percent": 0.6,
+  "min_loss_percent": 0.3
+}
