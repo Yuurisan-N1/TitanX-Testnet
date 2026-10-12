@@ -1,0 +1,6 @@
+curl_cffi==0.16.3
+eth-account==0.13.7
+cryptography==44.0.2
+colorama==0.4.6
+pyfiglet==1.0.4
+yuurisan==1.0.4
