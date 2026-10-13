@@ -493,6 +493,28 @@ def open_positions(session, market=""):
     return found
 
 
+def open_orders(session, market):
+    data = session.call("GET", "/v1/me/orders", query=f"?market={market}&limit=50")
+    return data.get("items") or []
+
+
+def armed_triggers(session, market):
+    data = session.call("GET", "/v1/me/triggers", query="?status=armed&limit=100")
+    found = []
+    for trigger in data.get("items") or []:
+        name = trigger.get("market") or trigger.get("symbol") or ""
+        if not name or name == market:
+            found.append(trigger)
+    return found
+
+
+def resting_count(session, market):
+    try:
+        return len(open_orders(session, market)) + len(armed_triggers(session, market))
+    except TitanError:
+        return 0
+
+
 def wait_flat(session, market):
     width = 0
     while True:
@@ -507,6 +529,35 @@ def wait_flat(session, market):
         width = max(width, len(plain))
         print(f"\r{YELLOW}{BOLD}Position {name} still open with {pnl_figure(live)} unrealized{RESET}", end="", flush=True)
         time.sleep(5)
+
+
+def await_close(session, market, width=0):
+    last = None
+    held_seen = False
+    blind = 0
+    while True:
+        held = open_positions(session, market)
+        if held:
+            held_seen = True
+            blind = 0
+            last = held[0]
+            live = float(last.get("unrealizedPnl") or 0)
+            plain = f"PnL {live:+.2f} USDCX on {market}"
+            width = max(width, len(plain))
+            frame = f"PnL {pnl_figure(live)} on {market}"
+            pad = " " * (width - len(plain))
+            print(f"\r{YELLOW}{BOLD}{frame}{RESET}{pad}", end="", flush=True)
+        elif held_seen:
+            break
+        elif resting_count(session, market):
+            blind = 0
+        elif blind >= 6:
+            break
+        else:
+            blind += 1
+        time.sleep(5)
+    print("\r" + " " * width + "\r", end="", flush=True)
+    return last
 
 
 def run_market(session, market, info, config, pnl):
@@ -532,16 +583,18 @@ def run_market(session, market, info, config, pnl):
     min_profit = float(config.get("min_profit_percent") or 0)
     min_loss = float(config.get("min_loss_percent") or 0)
     entry = None
-    for attempt in range(1, 4):
+    attempt = 0
+    while entry is None:
+        attempt += 1
         mark = fetch_mark(session, market)
         reference = float((mark or {}).get("markPrice") or 0)
         if reference <= 0:
-            log_red(f"No mark price for {clean_text(market, 'market')}, the entry is skipped")
-            return False
+            log_red(f"No mark price for {clean_text(market, 'market')}, retrying the entry")
+            continue
         cap_price = slip_price(reference, side, 0.0002, sz_dec)
         if not cap_price:
-            log_red(f"No slippage price for {clean_text(market, 'market')}, the entry is skipped")
-            return False
+            log_red(f"No slippage price for {clean_text(market, 'market')}, retrying the entry")
+            continue
 
         try:
             sizing = fetch_sizing(session, market, cap_price)
@@ -556,12 +609,12 @@ def run_market(session, market, info, config, pnl):
             size = cap_size if cap_size > 0 else (before * max_lev) / cap_price
         size = math.floor(size * (10 ** sz_dec)) / (10 ** sz_dec)
         if size <= 0 or size * reference < min_notional:
-            log_yellow(f"Balance is below the smallest order size on {clean_text(market, 'market')}")
-            return False
+            log_yellow(f"Balance is below the smallest order size on {clean_text(market, 'market')}, retrying the entry")
+            continue
 
         take_profit = None
         stop_loss = None
-        guard = max(tick_step(reference) * 3, reference * 0.0005 * (3 ** (attempt - 1)))
+        guard = max(tick_step(reference) * 3, reference * 0.0005 * (3 ** (min(attempt, 3) - 1)))
         if min_profit > 0:
             level = slip_price(reference * (1 + direction * min_profit / 100 / max_lev), side, 0, sz_dec)
             if level:
@@ -574,21 +627,19 @@ def run_market(session, market, info, config, pnl):
             stop_loss = {"trigger": size_str(level)} if level else None
 
         try:
-            entry = place_order(session, market, side, size, cap_price, "ioc", False, take_profit, stop_loss)
+            order = place_order(session, market, side, size, cap_price, "ioc", False, take_profit, stop_loss)
         except TitanError as error:
-            if attempt < 3:
-                log_yellow(f"Entry on {clean_text(market, 'market')} was refused, retrying with room to spare")
-                time.sleep(1)
-                continue
-            raise error
-        if entry.get("ok") and entry.get("fills") and not entry.get("resting"):
-            break
-        if attempt < 3:
-            log_yellow(f"Entry on {clean_text(market, 'market')} did not fill, retrying at a fresh price")
-            time.sleep(1)
+            if error.status in (401, 403):
+                raise error
+            log_yellow(f"Entry on {clean_text(market, 'market')} was refused, retrying with room to spare")
             continue
-        log_red(f"Entry on {clean_text(market, 'market')} did not fill after three tries")
-        return False
+        if order.get("ok") and order.get("fills") and not order.get("resting"):
+            entry = order
+            break
+        if attempt % 3 == 0:
+            log_red(f"Entry on {clean_text(market, 'market')} did not fill after three tries, opening a fresh entry")
+        else:
+            log_yellow(f"Entry on {clean_text(market, 'market')} did not fill, retrying at a fresh price")
 
     fill = 0.0
     for field in ("avgPrice", "avgFillPrice", "fillPrice", "price"):
@@ -604,25 +655,7 @@ def run_market(session, market, info, config, pnl):
     log_green(f"Entry filled: {clean_text(side, 'side')} {clean_text(size_str(size), 0)} {clean_text(market, 'market')} at price {clean_text(size_str(shown), 0)}")
     log_yellow(f"Take profit at {clean_text(tp_text, 0)} and stop loss at {clean_text(sl_text, 0)}, both resting on the exchange")
 
-    last = None
-    width = 0
-    held_once = False
-    while True:
-        time.sleep(5)
-        held = open_positions(session, market)
-        if held:
-            held_once = True
-            last = held[0]
-            live = float(last.get("unrealizedPnl") or 0)
-            plain = f"PnL {live:+.2f} USDCX on {market}"
-            width = max(width, len(plain))
-            frame = f"PnL {pnl_figure(live)} on {market}"
-            pad = " " * (width - len(plain))
-            print(f"\r{YELLOW}{BOLD}{frame}{RESET}{pad}", end="", flush=True)
-            continue
-        if held_once:
-            break
-    print("\r" + " " * width + "\r", end="", flush=True)
+    last = await_close(session, market)
 
     balance = fetch_balance(session)
     after = float(balance.get("balance") or balance.get("available") or 0)
@@ -656,23 +689,31 @@ def run_account(wallet_key, proxy, config):
 
     claim_faucet(session)
     pnl = {"total": 0.0}
+    reopens = 0
     while True:
         market = random.choice(wanted)
         try:
             closed = run_market(session, market, meta[market], config, pnl)
         except TitanError as error:
             if error.status in (401, 403) and str(error.code) in ("unauthorized", "engine_session_rejected", "authentication_required"):
-                log_yellow("No trading account is open for this wallet yet, the entry waits")
-                return
+                session_key = Ed25519PrivateKey.generate()
+                auth = authorize(wallet_key, session_key, proxy) if reopens < 3 else {}
+                session_id = auth.get("sessionId")
+                if not session_id:
+                    log_yellow("No trading account is open for this wallet yet, the entry waits")
+                    return
+                session = Session(session_id, session_key, proxy)
+                reopens += 1
+                log_yellow("The trading session expired, signing in again")
+                continue
             reason = clean_message(error.detail(), "unknown error")
             trace = f" request {clean_message(error.request_id, '')}" if error.request_id else ""
             log_red(f"Exchange refused the request: {reason}{trace}")
-            return
+            continue
         if closed:
+            reopens = 0
             log_yellow(f"Total realized {pnl_figure(pnl['total'])}")
             show_banner(MY_PROJECT)
-        else:
-            return
 
 
 def main():
